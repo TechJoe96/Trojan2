@@ -4,10 +4,8 @@
 
 This project automates the insertion of 5 unique hardware Trojans into the OpenTitan SoC using Large Language Models (LLMs). All Trojans were generated using AI automation tools, and all AI interactions have been logged as required by the assignment.
 
-**Assignment**: Automating LLMs for Hardware Trojan Insertion  
 **Target**: OpenTitan SoC  
 **Trojans Generated**: 5 unique Trojans  
-**Due Date**: November 8
 
 ---
 
